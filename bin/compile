@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# bin/compile <build-dir> <cache-dir> <env-dir>
+
+agent_env_var=NESSUS_AGENT
+
+env_dir=$3
+is_buildpack_enabled=$(test -f "$env_dir/$agent_env_var" && cat "$env_dir"/"$agent_env_var")
+
+echo "------> Hello, World"
+if [[ $is_buildpack_enabled == 1 ]]
+then
+  echo "        buildpack is enabled"
+else
+  echo "        buildpack is NOT enabled"
+fi
