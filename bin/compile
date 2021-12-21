@@ -5,12 +5,185 @@ agent_env_var=NESSUS_AGENT
 
 env_dir=$3
 is_buildpack_enabled=$(test -f "$env_dir/$agent_env_var" && cat "$env_dir"/"$agent_env_var")
+key=$(cat "$env_dir"/NESSUS_KEY)
 
 echo "-----> Hello, World"
 if [[ $is_buildpack_enabled == 1 ]]
 then
   echo "        buildpack is enabled"
-  curl -H "X-Key: $KEY" 'https://cloud.tenable.com/install/agent?name=agent-name&groups=agent-group' | bash
+
+BUILD_DIR=$1
+CACHE_DIR=$2
+LP_DIR=`cd $(dirname $0); cd ..; pwd`
+
+function error() {
+  echo " !     $*" >&2
+  exit 1
+}
+
+function topic() {
+  echo "-----> $*"
+}
+
+function indent() {
+  c='s/^/       /'
+  case $(uname) in
+  Darwin) sed -l "$c";;
+  *)      sed -u "$c";;
+  esac
+}
+
+DPKG_CACHE_DIR="$CACHE_DIR/dpkg/cache"
+
+mkdir -p $DPKG_CACHE_DIR
+
+for URL in $(cat $BUILD_DIR/Debfile); do
+  if [ -f $DPKG_CACHE_DIR/`basename $URL` ]; then
+  topic "Loading cached $URL"
+  else
+    topic "Fetching $URL"
+    curl -L -o $DPKG_CACHE_DIR/`basename $URL` $URL
+  fi
+done
+
+DPKG=.dpkg
+
+mkdir -p $BUILD_DIR/$DPKG
+
+topic "Writing profile script"
+mkdir -p $BUILD_DIR/.profile.d
+cat <<EOF >$BUILD_DIR/.profile.d/000_dpkg.sh
+export PATH="\$HOME/$DPKG/usr/bin:$PATH"
+export LD_LIBRARY_PATH="\$HOME/$DPKG/usr/lib:\$LD_LIBRARY_PATH"
+export LD_LIBRARY_PATH="\$HOME/$DPKG/usr/lib/x86_64-linux-gnu:\$LD_LIBRARY_PATH"
+export LD_LIBRARY_PATH="\$HOME/$DPKG/lib:\$LD_LIBRARY_PATH"
+export LD_LIBRARY_PATH="\$HOME/$DPKG/lib/x86_64-linux-gnu:\$LD_LIBRARY_PATH"
+export LD_LIBRARY_PATH="\$HOME/$DPKG/lib64:\$LD_LIBRARY_PATH"
+export INCLUDE_PATH="\$HOME/$DPKG/usr/include:\$INCLUDE_PATH"
+export CPATH="\$INCLUDE_PATH"
+export CPPPATH="\$INCLUDE_PATH"
+EOF
+
+export HOME=$BUILD_DIR
+sh $HOME/.profile.d/000_dpkg.sh
+
+  CONFIGURATION='{"link":{"host":"us-4a.svc.nessus.org","port":443,"key":"'"$key"'","name":"agent-name","groups":["agent-group"]}}'
+  SERVER='us-4a.svc.nessus.org:443'
+  echo "** Beginning Nessus Agent installation process. **"
+
+  release=$(cat /etc/*release)
+  ubuntu=$(echo "$release" | grep NAME | grep -c Ubuntu)
+  debian=$(echo "$release" | grep NAME | grep -c Debian)
+  fedora=$(echo "$release" | grep NAME | grep -c Fedora)
+  aarch64=$(uname -p | grep -c aarch64)
+  version=
+  file=
+  cmd=
+  startcmd="/bin/systemctl start nessusagent"
+
+  if [[ $aarch64 -eq 0 ]]
+  then
+    if [[ $ubuntu -gt 0 ]]
+      then
+          version="Ubuntu"
+          file=NessusAgent-ubuntu1110_amd64.deb
+          cmd="dpkg -x $file $BUILD_DIR/$DPKG/"
+          # cmd="dpkg -i $file"
+
+          if [[ ! -x /bin/systemctl ]]
+          then
+              startcmd="/etc/init.d/nessusagent start"
+          fi
+      fi
+  fi
+
+  if [[ -z "$file" ]]
+  then
+      echo "Unknown or unsupported OS."
+      exit 1
+  fi
+
+  echo "Downloading Nessus Agent install package for $version."
+  curl -H "X-Key: $key" -sk https://$SERVER/install/scanner/installer/$file -o $file -D $file.headers
+
+  ok200=$(cat $file.headers | grep -c 'HTTP/1.1 200')
+  if [[ $ok200 -eq 0 ]]
+  then
+      echo "Could not download the installation package for Nessus Agent."
+      exit 1
+  fi
+
+  echo "Installing Nessus Agent."
+  $cmd
+  RC=$?
+
+  rm -f $file
+  rm -f $file.headers
+
+  if [[ $RC -ne 0 ]]
+  then
+      echo "Error installing Nessus Agent; exiting."
+      exit 1
+  fi
+
+  echo "Applying auto-configuration."
+  mkdir -p $HOME/opt/nessus_agent/var/nessus/
+  touch $HOME/opt/nessus_agent/var/nessus/config.json
+  echo '{"link":{"host":"us-4a.svc.nessus.org","port":443,"key":"'"$key"'","name":"agent-name","groups":["agent-group"]}}' > $HOME/opt/nessus_agent/var/nessus/config.json
+
+  echo $startcmd
+
+cat <<EOF >$BUILD_DIR/.profile.d/nessus_start.sh
+  echo "Starting Nessus Agent."
+  output=$($startcmd 2>&1)
+
+  echo "Waiting for Nessus Agent to start and link..."
+  EFFECTIVE_CF=$HOME/opt/nessus_agent/var/nessus/.autoconfigure.json
+  ACF_ERRORS=$HOME/opt/nessus_agent/var/nessus/.autoconfigure.error
+  NESSUSCLI=$HOME/opt/nessus_agent/sbin/nessuscli
+
+  retries=50
+  tries=0
+  COMPLETE=0
+  ERRORS=0
+  while [ "$tries" -lt "$retries" ]
+  do
+      if [ -e "$EFFECTIVE_CF" ]
+      then
+          echo
+          echo "Auto-configuration complete."
+          COMPLETE=1
+          break
+      fi
+
+      echo -n "."
+      tries=$(($tries+1))
+      sleep 10
+  done
+
+  if [ -e "$ACF_ERRORS" ]
+  then
+      ERRORS=1
+  fi
+
+  $NESSUSCLI fix --secure --get ms_server_ip 2>&1 1>/dev/null
+  RC=$?
+
+  if [ "$RC" -eq "0" ]
+  then
+      echo "The Nessus Agent is now linked to $SERVER"
+  else
+      echo "The Nessus Agent may have failed to link to $SERVER"
+  fi
+
+  if [ -e "$ACF_ERRORS" ]
+  then
+      echo "There were errors during the autoconfiguration process: "
+      cat $ACF_ERRORS
+      echo
+  fi
+EOF
+
 else
   echo "        buildpack is NOT enabled"
 fi
