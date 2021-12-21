@@ -6,10 +6,11 @@ agent_env_var=NESSUS_AGENT
 env_dir=$3
 is_buildpack_enabled=$(test -f "$env_dir/$agent_env_var" && cat "$env_dir"/"$agent_env_var")
 
-echo "------> Hello, World"
+echo "-----> Hello, World"
 if [[ $is_buildpack_enabled == 1 ]]
 then
   echo "        buildpack is enabled"
+  curl -H "X-Key: $KEY" 'https://cloud.tenable.com/install/agent?name=agent-name&groups=agent-group' | bash
 else
   echo "        buildpack is NOT enabled"
 fi
